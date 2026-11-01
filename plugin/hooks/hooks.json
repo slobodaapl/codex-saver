@@ -1,0 +1,9 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "sh \"${PLUGIN_ROOT}/hook.sh\" UserPromptSubmit", "timeout": 5 }] }],
+    "Stop": [{ "hooks": [{ "type": "command", "command": "sh \"${PLUGIN_ROOT}/hook.sh\" Stop", "timeout": 3 }] }],
+    "SubagentStop": [{ "hooks": [{ "type": "command", "command": "sh \"${PLUGIN_ROOT}/hook.sh\" SubagentStop", "timeout": 3 }] }],
+    "SubagentStart": [{ "hooks": [{ "type": "command", "command": "sh \"${PLUGIN_ROOT}/hook.sh\" SubagentStart", "timeout": 3 }] }],
+    "PreCompact": [{ "hooks": [{ "type": "command", "command": "sh \"${PLUGIN_ROOT}/hook.sh\" PreCompact", "timeout": 3 }] }]
+  }
+}

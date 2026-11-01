@@ -1,0 +1,6 @@
+{
+  "name": "codex-saver",
+  "plugins": [
+    { "name": "codex-saver", "source": { "source": "local", "path": "./plugin" } }
+  ]
+}
