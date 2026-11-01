@@ -1,6 +1,6 @@
 {
   "name": "codex-saver",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Schedule Codex compaction before the prompt cache expires.",
   "hooks": "./hooks/hooks.json"
 }

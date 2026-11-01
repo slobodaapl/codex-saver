@@ -1,9 +1,9 @@
 {
   "hooks": {
-    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "sh \"${PLUGIN_ROOT}/hook.sh\" UserPromptSubmit", "timeout": 5 }] }],
-    "Stop": [{ "hooks": [{ "type": "command", "command": "sh \"${PLUGIN_ROOT}/hook.sh\" Stop", "timeout": 3 }] }],
-    "SubagentStop": [{ "hooks": [{ "type": "command", "command": "sh \"${PLUGIN_ROOT}/hook.sh\" SubagentStop", "timeout": 3 }] }],
-    "SubagentStart": [{ "hooks": [{ "type": "command", "command": "sh \"${PLUGIN_ROOT}/hook.sh\" SubagentStart", "timeout": 3 }] }],
-    "PreCompact": [{ "hooks": [{ "type": "command", "command": "sh \"${PLUGIN_ROOT}/hook.sh\" PreCompact", "timeout": 3 }] }]
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "sh \"${PLUGIN_ROOT}/hook.sh\" UserPromptSubmit", "statusMessage": "Check thread cache and cancel scheduled compaction", "timeout": 5 }] }],
+    "Stop": [{ "hooks": [{ "type": "command", "command": "sh \"${PLUGIN_ROOT}/hook.sh\" Stop", "statusMessage": "Schedule thread compaction", "timeout": 3 }] }],
+    "SubagentStop": [{ "hooks": [{ "type": "command", "command": "sh \"${PLUGIN_ROOT}/hook.sh\" SubagentStop", "statusMessage": "Schedule subagent compaction or cleanup", "timeout": 3 }] }],
+    "SubagentStart": [{ "hooks": [{ "type": "command", "command": "sh \"${PLUGIN_ROOT}/hook.sh\" SubagentStart", "statusMessage": "Cancel scheduled subagent action", "timeout": 3 }] }],
+    "PreCompact": [{ "hooks": [{ "type": "command", "command": "sh \"${PLUGIN_ROOT}/hook.sh\" PreCompact", "statusMessage": "Cancel scheduled compaction", "timeout": 3 }] }]
   }
 }

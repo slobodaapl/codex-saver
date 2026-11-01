@@ -6,6 +6,7 @@
           {
             "type": "command",
             "command": "\"$HOME/Projects/personal/codex-saver/target/release/codex-saver\" hook",
+            "statusMessage": "Schedule thread compaction",
             "timeout": 3
           }
         ]
@@ -17,6 +18,7 @@
           {
             "type": "command",
             "command": "\"$HOME/Projects/personal/codex-saver/target/release/codex-saver\" hook",
+            "statusMessage": "Schedule subagent compaction or cleanup",
             "timeout": 3
           }
         ]
@@ -28,6 +30,7 @@
           {
             "type": "command",
             "command": "\"$HOME/Projects/personal/codex-saver/target/release/codex-saver\" hook",
+            "statusMessage": "Check thread cache and cancel scheduled compaction",
             "timeout": 5
           }
         ]
@@ -39,6 +42,7 @@
           {
             "type": "command",
             "command": "\"$HOME/Projects/personal/codex-saver/target/release/codex-saver\" hook",
+            "statusMessage": "Cancel scheduled subagent action",
             "timeout": 3
           }
         ]
@@ -50,6 +54,7 @@
           {
             "type": "command",
             "command": "\"$HOME/Projects/personal/codex-saver/target/release/codex-saver\" hook",
+            "statusMessage": "Cancel scheduled compaction",
             "timeout": 3
           }
         ]
