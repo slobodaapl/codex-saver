@@ -261,7 +261,15 @@ pub async fn prompt_age(
         })).await.map_err(format_rpc_error)?;
         let turns = result["data"].as_array().ok_or("invalid turn list")?;
         for turn in turns {
-            if turn["status"] != "completed" || event.turn_id.as_deref() == turn["id"].as_str() {
+            let current = thread["status"]["type"] == "active"
+                && turn["status"] == "inProgress"
+                && turn["id"]
+                    .as_str()
+                    .is_some_and(|id| event.turn_id.as_deref() == Some(id));
+            if !current
+                && (turn["status"] != "completed"
+                    || event.turn_id.as_deref() == turn["id"].as_str())
+            {
                 continue;
             }
             let completed_at = turn["completedAt"].as_u64();
@@ -279,10 +287,15 @@ pub async fn prompt_age(
                 None => completed_at
                     .is_some_and(|at| crate::clock::wall_now() < at.saturating_add(window)),
             };
-            if fresh {
+            if !current && fresh {
                 return Ok(PromptAge::Fresh);
             }
             let turn_id = turn["id"].as_str().ok_or("completed turn has no id")?;
+            let item_type = if current {
+                "userMessage"
+            } else {
+                "contextCompaction"
+            };
             if legacy {
                 let full = client.request("thread/turns/list", json!({
                     "threadId":id, "limit":25, "sortDirection":"desc", "itemsView":"full", "cursor":cursor
@@ -294,37 +307,36 @@ pub async fn prompt_age(
                 let items = matching["items"]
                     .as_array()
                     .ok_or("turn items are unavailable")?;
-                if items.iter().any(|item| item["type"] == "contextCompaction") {
+                if items.iter().any(|item| item["type"] == item_type) {
                     return Ok(PromptAge::Fresh);
                 }
-                return Ok(if tracked.is_some() || completed_at.is_some() {
-                    PromptAge::Stale
-                } else {
-                    PromptAge::Unknown
-                });
+            } else {
+                let mut item_cursor: Option<String> = None;
+                loop {
+                    let items = client
+                        .request(
+                            "thread/items/list",
+                            json!({
+                                "threadId":id, "turnId":turn_id, "limit":50,
+                                "sortDirection":if current { "asc" } else { "desc" }, "cursor":item_cursor
+                            }),
+                        )
+                        .await
+                        .map_err(format_rpc_error)?;
+                    let entries = items["data"].as_array().ok_or("invalid item list")?;
+                    if entries.iter().any(|entry| {
+                        entry["turnId"] == turn_id && entry["item"]["type"] == item_type
+                    }) {
+                        return Ok(PromptAge::Fresh);
+                    }
+                    match items["nextCursor"].as_str() {
+                        Some(next) => item_cursor = Some(next.to_owned()),
+                        None => break,
+                    }
+                }
             }
-            let mut item_cursor: Option<String> = None;
-            loop {
-                let items = client
-                    .request(
-                        "thread/items/list",
-                        json!({
-                            "threadId":id, "turnId":turn_id, "limit":50,
-                            "sortDirection":"desc", "cursor":item_cursor
-                        }),
-                    )
-                    .await
-                    .map_err(format_rpc_error)?;
-                let entries = items["data"].as_array().ok_or("invalid item list")?;
-                if entries.iter().any(|entry| {
-                    entry["turnId"] == turn_id && entry["item"]["type"] == "contextCompaction"
-                }) {
-                    return Ok(PromptAge::Fresh);
-                }
-                match items["nextCursor"].as_str() {
-                    Some(next) => item_cursor = Some(next.to_owned()),
-                    None => break,
-                }
+            if current {
+                continue;
             }
             return Ok(if tracked.is_some() || completed_at.is_some() {
                 PromptAge::Stale

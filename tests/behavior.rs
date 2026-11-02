@@ -22,6 +22,9 @@ use tokio::{
 };
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
+#[path = "support/prompt_activity.rs"]
+mod prompt_activity;
+
 static NEXT: AtomicU64 = AtomicU64::new(0);
 const SESSION: &str = "01a19756-b2fe-76f1-bdec-aa9091918001";
 const ROOT: &str = "01a19756-b2fe-76f1-bdec-aa9091918001";
