@@ -32,7 +32,7 @@ pub enum PromptAge {
 }
 
 fn matches_scheduled_turn(job: &Job, turn: &Value) -> bool {
-    turn["status"] == "completed"
+    matches!(turn["status"].as_str(), Some("completed" | "failed"))
         && turn["id"].as_str().is_some_and(|id| {
             id == job.turn_id
                 || job
@@ -267,7 +267,7 @@ pub async fn prompt_age(
                     .as_str()
                     .is_some_and(|id| event.turn_id.as_deref() == Some(id));
             if !current
-                && (turn["status"] != "completed"
+                && (!matches!(turn["status"].as_str(), Some("completed" | "failed"))
                     || event.turn_id.as_deref() == turn["id"].as_str())
             {
                 continue;
@@ -365,7 +365,10 @@ async fn still_current(client: &mut Client, job: &Job) -> Result<(), Outcome> {
         .request("thread/read", json!({"threadId":id}))
         .await
         .map_err(before_mutation)?;
-    if read["thread"]["status"]["type"] != "idle" {
+    if !matches!(
+        read["thread"]["status"]["type"].as_str(),
+        Some("idle" | "systemError")
+    ) {
         return Err(Outcome::Retry("thread became active".into()));
     }
     let turns = client
@@ -380,7 +383,7 @@ async fn still_current(client: &mut Client, job: &Job) -> Result<(), Outcome> {
     let current = turns["data"].as_array().and_then(|turns| turns.first());
     if !current.is_some_and(|turn| matches_scheduled_turn(job, turn)) {
         return Err(Outcome::Discard(
-            "scheduled turn is no longer the latest completed turn".into(),
+            "scheduled turn is no longer the latest eligible turn".into(),
         ));
     }
     Ok(())
@@ -416,9 +419,13 @@ pub async fn process(
         return Outcome::Discard("thread kind changed".into());
     }
     match thread["status"]["type"].as_str() {
-        Some("idle") => {}
+        Some("idle" | "systemError") => {}
         Some("active") => return Outcome::Retry("thread is active".into()),
-        other => return Outcome::Discard(format!("thread is not loaded and idle: {other:?}")),
+        other => {
+            return Outcome::Discard(format!(
+                "thread is not in a loaded, inactive state: {other:?}"
+            ));
+        }
     }
     let turns = match client
         .request(
@@ -436,7 +443,7 @@ pub async fn process(
         return Outcome::Retry("latest turn is not available yet".into());
     };
     if !matches_scheduled_turn(job, turn) {
-        return Outcome::Discard("scheduled turn is no longer the latest completed turn".into());
+        return Outcome::Discard("scheduled turn is no longer the latest eligible turn".into());
     }
 
     if job.subagent && thread["canAcceptDirectInput"] == false {
@@ -455,7 +462,10 @@ pub async fn process(
                 return Outcome::Retry("descendant status is unavailable".into());
             };
             if threads.iter().any(|child| {
-                !matches!(child["status"]["type"].as_str(), Some("idle" | "notLoaded"))
+                !matches!(
+                    child["status"]["type"].as_str(),
+                    Some("idle" | "systemError" | "notLoaded")
+                )
             }) {
                 return Outcome::Retry(
                     "a descendant is active or its status is unavailable".into(),

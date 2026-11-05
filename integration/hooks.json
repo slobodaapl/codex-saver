@@ -12,6 +12,18 @@
         ]
       }
     ],
+    "PostModelRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/Projects/personal/codex-saver/target/release/codex-saver\" hook",
+            "statusMessage": "Schedule compaction after failed request",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
     "SubagentStop": [
       {
         "hooks": [

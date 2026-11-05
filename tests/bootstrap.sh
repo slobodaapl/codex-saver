@@ -2,7 +2,7 @@
 set -eu
 
 PROJECT=$(CDPATH= cd "$(dirname "$0")/.." && pwd)
-HOOK="$PROJECT/plugin/hook.sh"
+HOOK=${CODEX_SAVER_HOOK_OVERRIDE:-"$PROJECT/plugin/hook.sh"}
 PLUGIN_ROOT="$PROJECT/plugin"
 mkdir -p "$PROJECT/target"
 TEST_ROOT=$(mktemp -d "$PROJECT/target/bootstrap-contract.XXXXXX")
@@ -154,6 +154,42 @@ assert any(word in message.lower() for word in words), "systemMessage does not d
 PY
 }
 
+assert_json_update_block() {
+	python3 - "$1" <<'PY'
+import json
+import re
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    value = json.load(stream)
+assert isinstance(value, dict), "block response root is not an object"
+assert set(value) == {"decision", "reason", "systemMessage"}, "block response has unexpected keys"
+assert value["decision"] == "block", "replacement response did not block the prompt"
+assert isinstance(value["reason"], str) and value["reason"].strip(), "missing non-empty block reason"
+message = value["systemMessage"]
+assert isinstance(message, str) and message.strip(), "missing non-empty systemMessage"
+normalized = re.sub(r"[^a-z0-9]+", " ", message.lower())
+assert "updated" in normalized, "systemMessage does not say the helper was updated"
+assert "codex" in normalized and "thread" in normalized and "reopen" in normalized, "systemMessage omits reopening the Codex thread"
+assert "trust" in normalized and "hook" in normalized, "systemMessage omits re-trusting the hook"
+assert "resend" in normalized and "message" in normalized, "systemMessage omits resending the message"
+PY
+}
+
+assert_hook_output() {
+	output=$1
+	id=$2
+	prefix=${3:-helper-output}
+	python3 - "$output" "$id" "$prefix" <<'PY'
+import sys
+
+with open(sys.argv[1], "rb") as stream:
+    actual = stream.read()
+expected = f"{sys.argv[3]}:{sys.argv[2]}\n".encode()
+assert actual == expected, f"helper stdout changed: expected {expected!r}, got {actual!r}"
+PY
+}
+
 assert_capture() {
 	id=$1
 	body=$2
@@ -163,6 +199,19 @@ assert_capture() {
 	assert_eq "$id input bytes" "$expected" "$actual"
 	arg=$(sed -n '1p' "$CAPTURE_DIR/$id.args")
 	assert_eq "$id helper command" hook "$arg"
+}
+
+assert_no_capture() {
+	[ ! -e "$CAPTURE_DIR/$1.sha256" ] || fail "helper received blocked prompt $1"
+}
+
+wait_hook_pending() {
+	status=$1
+	id=$2
+	if wait_for_file "$status" 2; then
+		fail "hook returned before its held update outcome for $id"
+	fi
+	assert_no_capture "$id"
 }
 
 setup_case() {
@@ -186,7 +235,23 @@ setup_case() {
 	MOCK_FAIL_ASSET=0
 	MOCK_BAD_SUMS=0
 	MOCK_CONCURRENT=0
+	MOCK_FAIL_LATEST=0
 	MOCK_NOW=
+}
+
+seed_installed_helper() {
+	cp -R "$TEST_ROOT/prompt-bootstrap/data/." "$DATA_DIR/"
+	cp -R "$TEST_ROOT/prompt-bootstrap/home/." "$CASE_ROOT/home/"
+}
+
+assert_version_tag() {
+	assert_eq "installed helper version" "$1" "$(cat "$DATA_DIR/version")"
+}
+
+assert_helper_file() {
+	if ! find "$DATA_DIR" -type f -perm -100 -exec cmp -s {} "$1" \; -print | grep -q .; then
+		fail "no installed executable matching $1"
+	fi
 }
 
 start_hook() {
@@ -227,6 +292,7 @@ start_hook() {
 				MOCK_FAIL_ASSET="$MOCK_FAIL_ASSET" \
 				MOCK_BAD_SUMS="$MOCK_BAD_SUMS" \
 				MOCK_CONCURRENT="$MOCK_CONCURRENT" \
+				MOCK_FAIL_LATEST="$MOCK_FAIL_LATEST" \
 				sh "$HOOK" "$event" > "$output"
 		rc=$?
 		printf '%s\n' "$rc" > "$status"
@@ -262,6 +328,7 @@ if [ "${1-}" = hook ]; then
 	printf '%s\n' "${CODEX_SAVER_OBSERVED_ORDER-}" > "$dir/$name.order"
 	digest=$(sha256sum | awk '{ print $1 }')
 	printf '%s\n' "$digest" > "$dir/$name.sha256"
+	printf 'helper-output:%s\n' "$name"
 fi
 SH
 	chmod +x "$FIXTURE_HELPER"
@@ -407,6 +474,10 @@ if [ "$kind" = latest ] && [ "$MOCK_GATE_LATEST" = 1 ]; then
 		exit 22
 	fi
 fi
+if [ "$kind" = latest ] && [ "$MOCK_FAIL_LATEST" = 1 ]; then
+	record_result latest:failed
+	exit 22
+fi
 if [ "$kind" = asset-x86 ] || [ "$kind" = asset-arm ]; then
 	if [ "$MOCK_CONCURRENT" = 1 ]; then
 		asset_number=$(next_asset_number)
@@ -439,7 +510,10 @@ case "$writeout" in
 	*url_effective*)
 		effective_url=$url
 		case "$url" in
-			*github.com/*/releases/latest*) effective_url=${url%/latest}/tag/v1.2.3 ;;
+			*github.com/*/releases/latest*)
+				latest_tag=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["tag_name"])' "$MOCK_FIXTURES/latest.json")
+				effective_url=${url%/latest}/tag/$latest_tag
+				;;
 		esac
 		printf '%s\n' "$effective_url"
 		;;
@@ -590,6 +664,36 @@ awk -v at="$stop_observed" -v order="$stop_order" -v before="$stop_before" -v re
 assert_clean_network_audit
 assert_no_payload_on_disk STOP_PRIVATE_PAYLOAD_MARKER
 
+setup_case post-model-request-bootstrap
+MOCK_GATE_DOWNLOAD=1
+post_model_request_before=$(awk '{ print $1 }' /proc/uptime)
+post_model_request_body='{"hook_event_name":"PostModelRequest","session_id":"failed-request-1","turn_id":"request-turn-1","transcript_path":"/workspace/session.jsonl","status":"failed","private":"STOP_PRIVATE_PAYLOAD_MARKER"}'
+start_hook PostModelRequest "$post_model_request_body" "$CASE_ROOT/hook.json" "$CASE_ROOT/hook.status" "$DATA_DIR" x86_64 post-model-request "$CASE_ROOT"
+post_model_request_pid=$LAST_PID
+post_model_request_run_id=$LAST_RUN_ID
+wait_hook_return "$CASE_ROOT/hook.status" "$post_model_request_pid"
+wait_for_log asset-x86 || fail "PostModelRequest bootstrap did not request x86_64 asset"
+sleep 4
+post_model_request_release=$(awk '{ print $1 }' /proc/uptime)
+touch "$MOCK_DOWNLOAD_RELEASE"
+wait_for_result asset-x86:ok || fail "PostModelRequest artifact download did not finish"
+wait_for_result sums:ok || fail "PostModelRequest SHA256SUMS download did not finish"
+wait_for_run_quiescence "$post_model_request_run_id" || fail "PostModelRequest bootstrap worker did not finish"
+assert_capture post-model-request "$post_model_request_body"
+assert_installed_fixture
+post_model_request_observed=$(cat "$CAPTURE_DIR/post-model-request.observed")
+post_model_request_order=$(cat "$CAPTURE_DIR/post-model-request.order")
+[ -n "$post_model_request_observed" ] || fail "PostModelRequest helper invocation lacked CODEX_SAVER_OBSERVED_AT"
+[ -n "$post_model_request_order" ] || fail "PostModelRequest helper invocation lacked CODEX_SAVER_OBSERVED_ORDER"
+awk -v at="$post_model_request_observed" -v order="$post_model_request_order" -v before="$post_model_request_before" -v released="$post_model_request_release" 'BEGIN {
+	order_seconds = order / 100
+	exit !(at + 0 >= before - 1 && at + 0 < before + 2 && at + 0 < released &&
+		order + 0 >= (before - 1) * 100 && order + 0 < (before + 2) * 100 &&
+		order + 0 < released * 100 && order_seconds >= at && order_seconds < at + 1)
+}' || fail "PostModelRequest observation mismatch: at=$post_model_request_observed order=$post_model_request_order before=$post_model_request_before release=$post_model_request_release"
+assert_clean_network_audit
+assert_no_payload_on_disk STOP_PRIVATE_PAYLOAD_MARKER
+
 # Failed artifact retrieval and checksum mismatch must leave no executable helper.
 setup_case failed-download
 MOCK_FAIL_ASSET=1
@@ -652,60 +756,180 @@ wait_for_run_quiescence "$concurrent_hook_run_id" || fail "post-concurrency help
 assert_clean_network_audit
 assert_no_payload_on_disk PROMPT_PRIVATE_PAYLOAD_MARKER
 
-# A stale cooldown triggers one async lookup; repeated prompts during that lookup are throttled.
-DATA_DIR="$TEST_ROOT/prompt-bootstrap/data"
-CASE_ROOT="$TEST_ROOT/prompt-bootstrap"
-CAPTURE_DIR="$CASE_ROOT/captures"
-MOCK_LOG="$CASE_ROOT/update.network.log"
-MOCK_RESULTS="$CASE_ROOT/update.network.results"
-MOCK_AUDIT="$CASE_ROOT/update.network.audit"
-MOCK_COUNTER="$CASE_ROOT/update.asset.counter"
-MOCK_COUNTER_LOCK="$CASE_ROOT/update.asset.counter.lock"
-MOCK_DOWNLOAD_RELEASE="$CASE_ROOT/update.download.release"
-MOCK_LATEST_RELEASE="$CASE_ROOT/update.latest.release"
-: > "$MOCK_LOG"
-: > "$MOCK_RESULTS"
-: > "$MOCK_AUDIT"
-: > "$MOCK_COUNTER"
-MOCK_GATE_DOWNLOAD=0
-MOCK_GATE_LATEST=1
-MOCK_FAIL_ASSET=0
-MOCK_BAD_SUMS=0
-MOCK_CONCURRENT=0
+# Due update with unchanged release waits for lookup, then forwards exact input/output.
+setup_case due-unchanged
+seed_installed_helper
 MOCK_NOW=$((MOCK_BOOTSTRAP_NOW + 86401))
-touch "$MOCK_DOWNLOAD_RELEASE"
+MOCK_GATE_LATEST=1
 body_one='{"session_id":"repeat-1","private":"PROMPT_PRIVATE_PAYLOAD_MARKER","message":"first exact prompt"}'
 start_hook UserPromptSubmit "$body_one" "$CASE_ROOT/repeat-1.json" "$CASE_ROOT/repeat-1.status" "$DATA_DIR" x86_64 repeat-1 "$CASE_ROOT"
 repeat_pid=$LAST_PID
-update_run_ids=$LAST_RUN_ID
+wait_for_log latest || fail "helper-present prompt did not start an update check after 24 hours"
+wait_hook_pending "$CASE_ROOT/repeat-1.status" repeat-1
+touch "$MOCK_LATEST_RELEASE"
 wait_hook_return "$CASE_ROOT/repeat-1.status" "$repeat_pid"
 assert_capture repeat-1 "$body_one"
-wait_for_log latest || fail "helper-present prompt did not start an update check after 24 hours"
+assert_hook_output "$CASE_ROOT/repeat-1.json" repeat-1
+assert_version_tag v1.2.3
 repeat_index=2
 while [ "$repeat_index" -le 4 ]; do
 	body=$(printf '{"session_id":"repeat-%s","private":"PROMPT_PRIVATE_PAYLOAD_MARKER","message":"unchanged exact bytes"}' "$repeat_index")
 	start_hook UserPromptSubmit "$body" "$CASE_ROOT/repeat-$repeat_index.json" "$CASE_ROOT/repeat-$repeat_index.status" "$DATA_DIR" x86_64 "repeat-$repeat_index" "$CASE_ROOT"
 	repeat_pid=$LAST_PID
-	update_run_ids="$update_run_ids $LAST_RUN_ID"
 	wait_hook_return "$CASE_ROOT/repeat-$repeat_index.status" "$repeat_pid"
 	assert_capture "repeat-$repeat_index" "$body"
+	assert_hook_output "$CASE_ROOT/repeat-$repeat_index.json" "repeat-$repeat_index"
 	repeat_index=$((repeat_index + 1))
 done
-latest_requests=$(count_log latest)
-assert_eq "latest requests while first update check is held" 1 "$latest_requests"
-touch "$MOCK_LATEST_RELEASE"
-wait_for_result latest:ok || fail "held helper-present update check did not finish"
-for run_id in $update_run_ids; do
-	wait_for_run_quiescence "$run_id" || fail "helper-present hook/update worker did not finish: $run_id"
+assert_eq "release lookups within cooldown" 1 "$(count_log latest)"
+assert_eq "unchanged latest tag binary downloads" 0 "$(count_log asset-x86)"
+assert_eq "unchanged latest tag checksum downloads" 0 "$(count_log sums)"
+assert_clean_network_audit
+assert_no_payload_on_disk PROMPT_PRIVATE_PAYLOAD_MARKER
+
+# Candidate v1.2.4 changes helper bytes and release metadata; failures preserve v1.2.3.
+OLD_HELPER="$FIXTURES/helper.v1.2.3"
+cp "$FIXTURE_HELPER" "$OLD_HELPER"
+sed 's/helper-output:/updated-helper-output:/' "$FIXTURE_HELPER" > "$FIXTURES/helper.updated"
+mv "$FIXTURES/helper.updated" "$FIXTURE_HELPER"
+UPDATED_SUM=$(sha256sum "$FIXTURE_HELPER" | awk '{ print $1 }')
+{
+	printf '%s  %s\n' "$UPDATED_SUM" "$X86_NAME"
+	printf '%s  %s\n' "$UPDATED_SUM" "$ARM_NAME"
+} > "$FIXTURES/SHA256SUMS"
+sed 's/v1.2.3/v1.2.4/g' "$FIXTURES/latest.json" > "$FIXTURES/latest.next"
+mv "$FIXTURES/latest.next" "$FIXTURES/latest.json"
+
+setup_case failed-update-lookup
+seed_installed_helper
+MOCK_NOW=$((MOCK_BOOTSTRAP_NOW + 2 * 86401))
+MOCK_FAIL_LATEST=1
+failed_lookup_body='{"session_id":"failed-lookup","private":"PROMPT_PRIVATE_PAYLOAD_MARKER"}'
+start_hook UserPromptSubmit "$failed_lookup_body" "$CASE_ROOT/hook.json" "$CASE_ROOT/hook.status" "$DATA_DIR" x86_64 failed-lookup "$CASE_ROOT"
+failed_pid=$LAST_PID
+wait_hook_return "$CASE_ROOT/hook.status" "$failed_pid"
+wait_for_result latest:failed || fail "mocked latest-release lookup failure was not reached"
+assert_capture failed-lookup "$failed_lookup_body"
+assert_hook_output "$CASE_ROOT/hook.json" failed-lookup
+assert_helper_file "$OLD_HELPER"
+assert_version_tag v1.2.3
+assert_clean_network_audit
+assert_no_payload_on_disk PROMPT_PRIVATE_PAYLOAD_MARKER
+
+setup_case failed-update-download
+seed_installed_helper
+MOCK_NOW=$((MOCK_BOOTSTRAP_NOW + 3 * 86401))
+MOCK_FAIL_ASSET=1
+failed_download_body='{"session_id":"failed-download","private":"PROMPT_PRIVATE_PAYLOAD_MARKER"}'
+start_hook UserPromptSubmit "$failed_download_body" "$CASE_ROOT/hook.json" "$CASE_ROOT/hook.status" "$DATA_DIR" x86_64 failed-download "$CASE_ROOT"
+failed_pid=$LAST_PID
+wait_hook_return "$CASE_ROOT/hook.status" "$failed_pid"
+wait_for_result asset-x86:failed || {
+	cat "$MOCK_LOG" >&2
+	cat "$MOCK_RESULTS" >&2
+	fail "mocked update artifact failure was not reached"
+}
+assert_capture failed-download "$failed_download_body"
+assert_hook_output "$CASE_ROOT/hook.json" failed-download
+assert_helper_file "$OLD_HELPER"
+assert_version_tag v1.2.3
+assert_clean_network_audit
+assert_no_payload_on_disk PROMPT_PRIVATE_PAYLOAD_MARKER
+
+setup_case failed-update-checksum
+seed_installed_helper
+MOCK_NOW=$((MOCK_BOOTSTRAP_NOW + 4 * 86401))
+MOCK_BAD_SUMS=1
+failed_checksum_body='{"session_id":"failed-checksum","private":"PROMPT_PRIVATE_PAYLOAD_MARKER"}'
+start_hook UserPromptSubmit "$failed_checksum_body" "$CASE_ROOT/hook.json" "$CASE_ROOT/hook.status" "$DATA_DIR" x86_64 failed-checksum "$CASE_ROOT"
+failed_pid=$LAST_PID
+wait_hook_return "$CASE_ROOT/hook.status" "$failed_pid"
+wait_for_result asset-x86:ok || fail "artifact for update checksum test was not downloaded"
+wait_for_result sums:ok || fail "mismatched update SHA256SUMS was not downloaded"
+assert_capture failed-checksum "$failed_checksum_body"
+assert_hook_output "$CASE_ROOT/hook.json" failed-checksum
+assert_helper_file "$OLD_HELPER"
+assert_version_tag v1.2.3
+assert_clean_network_audit
+assert_no_payload_on_disk PROMPT_PRIVATE_PAYLOAD_MARKER
+
+# Successful replacement blocks the triggering send; cooldown invocation forwards without a false update notice.
+setup_case successful-update
+seed_installed_helper
+MOCK_NOW=$((MOCK_BOOTSTRAP_NOW + 5 * 86401))
+MOCK_GATE_DOWNLOAD=1
+update_body='{"session_id":"update-1","private":"PROMPT_PRIVATE_PAYLOAD_MARKER","message":"must not reach old helper"}'
+start_hook UserPromptSubmit "$update_body" "$CASE_ROOT/update.json" "$CASE_ROOT/update.status" "$DATA_DIR" x86_64 update-1 "$CASE_ROOT"
+update_pid=$LAST_PID
+wait_for_log asset-x86 || fail "due update did not request the replacement artifact"
+wait_hook_pending "$CASE_ROOT/update.status" update-1
+touch "$MOCK_DOWNLOAD_RELEASE"
+wait_for_result asset-x86:ok || fail "replacement artifact did not finish downloading"
+wait_for_result sums:ok || fail "replacement SHA256SUMS did not finish downloading"
+wait_hook_return "$CASE_ROOT/update.status" "$update_pid"
+assert_json_update_block "$CASE_ROOT/update.json"
+assert_no_capture update-1
+assert_helper_file "$FIXTURE_HELPER"
+assert_version_tag v1.2.4
+assert_clean_network_audit
+assert_no_payload_on_disk PROMPT_PRIVATE_PAYLOAD_MARKER
+
+cooldown_body='{"session_id":"after-update","private":"PROMPT_PRIVATE_PAYLOAD_MARKER","message":"forward after completed update"}'
+start_hook UserPromptSubmit "$cooldown_body" "$CASE_ROOT/after-update.json" "$CASE_ROOT/after-update.status" "$DATA_DIR" x86_64 after-update "$CASE_ROOT"
+cooldown_pid=$LAST_PID
+wait_hook_return "$CASE_ROOT/after-update.status" "$cooldown_pid"
+assert_capture after-update "$cooldown_body"
+assert_hook_output "$CASE_ROOT/after-update.json" after-update updated-helper-output
+assert_eq "release lookups after completed update cooldown" 1 "$(count_log latest)"
+assert_clean_network_audit
+assert_no_payload_on_disk PROMPT_PRIVATE_PAYLOAD_MARKER
+
+# A waiter must observe binary replacement even when version metadata cannot be persisted.
+setup_case update-metadata-failure-waiter
+seed_installed_helper
+MOCK_NOW=$((MOCK_BOOTSTRAP_NOW + 6 * 86401))
+MOCK_GATE_DOWNLOAD=1
+sed 's/v1.2.4/v1.2.5/g' "$FIXTURES/latest.json" > "$FIXTURES/latest.next"
+mv "$FIXTURES/latest.next" "$FIXTURES/latest.json"
+update_first_body='{"session_id":"metadata-first","private":"PROMPT_PRIVATE_PAYLOAD_MARKER"}'
+start_hook UserPromptSubmit "$update_first_body" "$CASE_ROOT/first.json" "$CASE_ROOT/first.status" "$DATA_DIR" x86_64 metadata-first "$CASE_ROOT"
+first_pid=$LAST_PID
+first_run_id=$LAST_RUN_ID
+wait_for_log asset-x86 || fail "metadata-failure update did not reach artifact download"
+wait_hook_pending "$CASE_ROOT/first.status" metadata-first
+assert_version_tag v1.2.3
+mv "$DATA_DIR/version" "$CASE_ROOT/version.v1.2.3"
+mkdir "$DATA_DIR/version"
+chmod 555 "$DATA_DIR/version"
+if touch "$DATA_DIR/version/write-probe" 2>/dev/null; then
+	rm -f "$DATA_DIR/version/write-probe"
+	fail "test could not make the version metadata path unwritable"
+fi
+
+update_waiter_body='{"session_id":"metadata-waiter","private":"PROMPT_PRIVATE_PAYLOAD_MARKER"}'
+start_hook UserPromptSubmit "$update_waiter_body" "$CASE_ROOT/waiter.json" "$CASE_ROOT/waiter.status" "$DATA_DIR" x86_64 metadata-waiter "$CASE_ROOT"
+waiter_pid=$LAST_PID
+waiter_run_id=$LAST_RUN_ID
+attempt=0
+while ! has_live_mock_run "$waiter_run_id"; do
+	[ "$attempt" -lt 10 ] || fail "metadata waiter did not start while updater was held"
+	sleep 1
+	attempt=$((attempt + 1))
 done
-latest_count=$(awk '$0 == "latest:ok" { n++ } END { print n + 0 }' "$MOCK_RESULTS")
-[ "$latest_count" -eq 1 ] || fail "repeated prompts launched $latest_count update checks inside the cooldown"
-asset_count=$(awk '$0 == "asset-x86:ok" || $0 == "asset-arm:ok" { n++ } END { print n + 0 }' "$MOCK_RESULTS")
-assert_eq "unchanged latest tag binary downloads" 0 "$asset_count"
-sum_count=$(awk '$0 == "sums:ok" { n++ } END { print n + 0 }' "$MOCK_RESULTS")
-assert_eq "unchanged latest tag checksum downloads" 0 "$sum_count"
-unknown_count=$(awk '$0 == "unknown:failed" { n++ } END { print n + 0 }' "$MOCK_RESULTS")
-assert_eq "unmocked network requests" 0 "$unknown_count"
+wait_hook_pending "$CASE_ROOT/waiter.status" metadata-waiter
+touch "$MOCK_DOWNLOAD_RELEASE"
+wait_for_result asset-x86:ok || fail "metadata-failure replacement artifact did not finish downloading"
+wait_for_result sums:ok || fail "metadata-failure replacement SHA256SUMS did not finish downloading"
+wait_hook_return "$CASE_ROOT/first.status" "$first_pid"
+wait_hook_return "$CASE_ROOT/waiter.status" "$waiter_pid"
+assert_json_update_block "$CASE_ROOT/first.json"
+assert_json_update_block "$CASE_ROOT/waiter.json"
+assert_no_capture metadata-first
+assert_no_capture metadata-waiter
+assert_helper_file "$FIXTURE_HELPER"
+[ -d "$DATA_DIR/version" ] || fail "version metadata unexpectedly became readable after blocked write"
+[ -z "$(find "$DATA_DIR/version" -type f -print)" ] || fail "version metadata was persisted despite the unwritable path"
+assert_eq "release lookups during metadata-failure update" 1 "$(count_log latest)"
 assert_clean_network_audit
 assert_no_payload_on_disk PROMPT_PRIVATE_PAYLOAD_MARKER
 

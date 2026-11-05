@@ -18,7 +18,7 @@ use tokio::{
         oneshot,
     },
     task::JoinHandle,
-    time::{Instant, timeout_at},
+    time::{Instant, timeout, timeout_at},
 };
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
@@ -618,6 +618,29 @@ fn root_stop_for(session_id: &str, turn_id: &str, transcript_path: &str) -> Valu
 
 fn root_stop(turn_id: &str) -> Value {
     root_stop_for(SESSION, turn_id, ROOT_PATH)
+}
+
+fn post_model_request(
+    status: Option<&str>,
+    turn_id: Option<&str>,
+    transcript_path: &str,
+    agent_id: Option<&str>,
+) -> Value {
+    let mut event = json!({
+        "hook_event_name": "PostModelRequest",
+        "session_id": SESSION,
+        "transcript_path": transcript_path,
+    });
+    if let Some(status) = status {
+        event["status"] = json!(status);
+    }
+    if let Some(turn_id) = turn_id {
+        event["turn_id"] = json!(turn_id);
+    }
+    if let Some(agent_id) = agent_id {
+        event["agent_id"] = json!(agent_id);
+    }
+    event
 }
 
 fn root_prompt() -> Value {
@@ -1340,6 +1363,307 @@ async fn root_fork_uses_transcript_uuid_when_it_differs_from_session_id() {
 }
 
 #[tokio::test]
+async fn failed_post_model_request_arms_matching_inactive_thread() {
+    let cases = [
+        (FORK, FORK_PATH, None, None, "systemError", "failed"),
+        (ROOT, ROOT_PATH, None, None, "idle", "completed"),
+        (
+            CHILD,
+            ROOT_PATH,
+            Some(CHILD),
+            Some(ROOT),
+            "systemError",
+            "failed",
+        ),
+    ];
+
+    for (thread_id, transcript_path, agent_id, parent_id, thread_status, turn_status) in cases {
+        let harness = Harness::start(1, 30).await;
+        let listener = harness.listener();
+        let thread = thread_view(
+            thread_id,
+            SESSION,
+            transcript_path,
+            parent_id,
+            thread_status,
+            true,
+        );
+        let mut mock = start_rpc_mock(
+            listener,
+            RpcPlan::new(
+                thread,
+                turns(vec![prompt_turn(TURN, turn_status, None)]),
+                TURN,
+            ),
+        )
+        .await;
+        let stderr_before = harness.stderr_text();
+
+        let output = harness.hook_with_metadata(
+            post_model_request(Some("failed"), Some(TURN), transcript_path, agent_id),
+            None,
+            Some(boot_time_seconds()),
+        );
+        assert!(output.status.success());
+        assert!(output.stdout.is_empty());
+
+        compact_after_resume(&mut mock, thread_id).await;
+        assert_compaction_events(&mut mock, thread_id, TURN, "completed", true).await;
+        wait_for_compacted(&harness, &stderr_before).await;
+    }
+}
+
+#[tokio::test]
+async fn failed_post_model_request_does_not_mutate_an_active_thread() {
+    let mut harness = Harness::start(1, 30).await;
+    let listener = harness.listener();
+    let thread = thread_view(ROOT, SESSION, ROOT_PATH, None, "active", true);
+    let mut mock = start_rpc_mock(
+        listener,
+        RpcPlan::new(thread, turns(vec![prompt_turn(TURN, "failed", None)]), TURN),
+    )
+    .await;
+
+    let output = harness.hook_with_metadata(
+        post_model_request(Some("failed"), Some(TURN), ROOT_PATH, None),
+        None,
+        Some(boot_time_seconds()),
+    );
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+    let calls = collect_calls(&mut mock, Duration::from_millis(1500)).await;
+    assert!(
+        calls.iter().any(|call| call["method"] == "thread/read"),
+        "failed request did not check thread activity: {calls:?}"
+    );
+    assert_no_mutation(&calls);
+    harness.assert_service_running();
+}
+
+#[tokio::test]
+async fn newer_failed_request_supersedes_older_pending_turn() {
+    let harness = Harness::start(1, 30).await;
+    let listener = harness.listener();
+    let thread = thread_view(ROOT, SESSION, ROOT_PATH, None, "systemError", true);
+    let mut mock = start_rpc_mock(
+        listener,
+        RpcPlan::new(
+            thread,
+            turns(vec![
+                prompt_turn(NEW_TURN, "failed", None),
+                prompt_turn(TURN, "failed", None),
+            ]),
+            NEW_TURN,
+        ),
+    )
+    .await;
+    let stderr_before = harness.stderr_text();
+
+    for turn_id in [TURN, NEW_TURN] {
+        let output = harness.hook_with_metadata(
+            post_model_request(Some("failed"), Some(turn_id), ROOT_PATH, None),
+            None,
+            Some(boot_time_seconds()),
+        );
+        assert!(output.status.success());
+        assert!(output.stdout.is_empty());
+    }
+
+    assert_root_compaction(&harness, &mut mock, NEW_TURN, &stderr_before).await;
+    let later = collect_calls(&mut mock, Duration::from_millis(1200)).await;
+    assert!(
+        !later
+            .iter()
+            .any(|call| call["method"] == "thread/compact/start"),
+        "superseded failed request scheduled another compaction: {later:?}"
+    );
+}
+
+#[tokio::test]
+async fn nonfailed_or_unidentified_post_model_request_does_not_arm_work() {
+    let cases = [
+        post_model_request(Some("completed"), Some(TURN), ROOT_PATH, None),
+        post_model_request(Some("cancelled"), Some(TURN), ROOT_PATH, None),
+        post_model_request(None, Some(TURN), ROOT_PATH, None),
+        post_model_request(Some("unknown"), Some(TURN), ROOT_PATH, None),
+        post_model_request(Some("failed"), None, ROOT_PATH, None),
+        post_model_request(Some("failed"), Some(""), ROOT_PATH, None),
+    ];
+
+    for event in cases {
+        let mut harness = Harness::start(1, 1).await;
+        let listener = harness.listener();
+        let thread = thread_view(ROOT, SESSION, ROOT_PATH, None, "idle", true);
+        let mut mock = start_rpc_mock(
+            listener,
+            RpcPlan::new(thread, turns(vec![completed_turn(TURN)]), TURN),
+        )
+        .await;
+
+        let output = harness.hook_with_metadata(event, None, Some(boot_time_seconds()));
+        assert!(output.status.success());
+        assert!(output.stdout.is_empty());
+        let calls = collect_all_calls(&mut mock, Duration::from_millis(1400)).await;
+        assert!(calls.is_empty(), "ineligible request armed work: {calls:?}");
+        harness.assert_service_running();
+    }
+}
+
+#[tokio::test]
+async fn completed_and_cancelled_attempts_do_not_reset_a_failed_request_timer() {
+    let harness = Harness::start(3, 30).await;
+    let listener = harness.listener();
+    let thread = thread_view(ROOT, SESSION, ROOT_PATH, None, "idle", true);
+    let mut mock = start_rpc_mock(
+        listener,
+        RpcPlan::new(thread, turns(vec![completed_turn(TURN)]), TURN),
+    )
+    .await;
+    let stderr_before = harness.stderr_text();
+    let started = Instant::now();
+    let failed = harness.hook_with_metadata(
+        post_model_request(Some("failed"), Some(TURN), ROOT_PATH, None),
+        None,
+        Some(boot_time_seconds()),
+    );
+    assert!(failed.status.success());
+    assert!(failed.stdout.is_empty());
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    for status in ["completed", "cancelled"] {
+        let output = harness.hook_with_metadata(
+            post_model_request(Some(status), Some(TURN), ROOT_PATH, None),
+            None,
+            Some(boot_time_seconds()),
+        );
+        assert!(output.status.success());
+        assert!(output.stdout.is_empty());
+    }
+
+    let before_compaction = timeout(Duration::from_millis(1600), async {
+        let before_resume = calls_until_mutation(&mut mock, "thread/resume").await;
+        calls_until_mutation_after(&mut mock, "thread/compact/start", before_resume).await
+    })
+    .await
+    .expect("non-failed attempts postponed the original failed-request timer");
+    assert_final_turn_check(&before_compaction, ROOT);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "failed-request timer was reset by a later attempt"
+    );
+    assert_compaction_events(&mut mock, ROOT, TURN, "completed", true).await;
+    wait_for_compacted(&harness, &stderr_before).await;
+}
+
+#[tokio::test]
+async fn new_prompt_cancels_a_failed_request_schedule() {
+    let harness = Harness::start(3, 30).await;
+    let listener = harness.listener();
+    let thread = thread_view(ROOT, SESSION, ROOT_PATH, None, "idle", true);
+    let mut mock = start_rpc_mock(
+        listener,
+        RpcPlan::new(thread, turns(vec![completed_turn(TURN)]), TURN),
+    )
+    .await;
+
+    let scheduled_at = Instant::now();
+    let failed = harness.hook_with_metadata(
+        post_model_request(Some("failed"), Some(TURN), ROOT_PATH, None),
+        None,
+        Some(boot_time_seconds()),
+    );
+    assert!(failed.status.success());
+    assert!(failed.stdout.is_empty());
+    let jobs_file = wait_for_persisted_turn(&harness.root.join("state"), TURN).await;
+    assert!(persisted_jobs_contain_turn(&jobs_file, TURN));
+    assert!(
+        scheduled_at.elapsed() < Duration::from_secs(3),
+        "failed-request job reached its timer before the cancellation step"
+    );
+    harness.hook(root_prompt());
+
+    let calls = collect_all_calls(&mut mock, Duration::from_millis(3500)).await;
+    assert!(
+        calls.is_empty(),
+        "new prompt did not cancel failed work: {calls:?}"
+    );
+}
+
+#[tokio::test]
+async fn failed_request_observation_ages_into_stale_prompt_rejection() {
+    let harness = Harness::start_with_window(60, 30, Some(2)).await;
+    let listener = harness.listener();
+    let thread = thread_view(ROOT, SESSION, ROOT_PATH, None, "systemError", true);
+    let mut mock = start_rpc_mock(
+        listener,
+        RpcPlan::new(
+            thread,
+            turns(vec![prompt_turn(TURN, "failed", None)]),
+            NEW_TURN,
+        ),
+    )
+    .await;
+
+    let failed = harness.hook_with_metadata(
+        post_model_request(Some("failed"), Some(TURN), ROOT_PATH, None),
+        None,
+        Some(boot_time_seconds()),
+    );
+    assert!(failed.status.success());
+    assert!(failed.stdout.is_empty());
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let output = harness
+        .hook_output(root_prompt_with("Continue from the failed request."))
+        .await;
+    let reason = assert_prompt_block(output);
+    assert!(
+        !reason.to_lowercase().contains("unknown"),
+        "failed request observation was lost; stale age became unknown: {reason}"
+    );
+    let calls = collect_all_calls(&mut mock, Duration::from_millis(100)).await;
+    assert!(
+        calls
+            .iter()
+            .any(|call| call["method"] == "thread/turns/list"),
+        "stale prompt check did not inspect the latest turn: {calls:?}"
+    );
+    assert_no_prompt_dispatch(&calls);
+    assert_no_mutation(&calls);
+}
+
+#[tokio::test]
+async fn failed_request_schedule_expires_outside_the_cache_window() {
+    let mut harness = Harness::start_with_window(3, 1, Some(1)).await;
+    let listener = harness.listener();
+    let thread = thread_view(ROOT, SESSION, ROOT_PATH, None, "systemError", true);
+    let mut mock = start_rpc_mock(
+        listener,
+        RpcPlan::new(thread, turns(vec![prompt_turn(TURN, "failed", None)]), TURN),
+    )
+    .await;
+
+    let observed_at = boot_time_seconds();
+    let output = harness.hook_with_metadata(
+        post_model_request(Some("failed"), Some(TURN), ROOT_PATH, None),
+        None,
+        Some(observed_at),
+    );
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+    let jobs_file = wait_for_persisted_turn(&harness.root.join("state"), TURN).await;
+    assert!(persisted_jobs_contain_turn(&jobs_file, TURN));
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        boot_time_seconds() > observed_at.saturating_add(1),
+        "failed-request cache window had not expired before its timer"
+    );
+    let calls = collect_calls(&mut mock, Duration::from_secs(2)).await;
+    assert_no_mutation(&calls);
+    harness.assert_service_running();
+}
+
+#[tokio::test]
 async fn a_prompt_cancels_pending_root_work_and_a_newer_stop_reschedules_it() {
     let harness = Harness::start(1, 30).await;
     let listener = harness.listener();
@@ -1644,6 +1968,42 @@ async fn idle_child_without_direct_input_is_deleted_only_after_empty_descendant_
             .iter()
             .any(|call| call["method"] == "thread/turns/list")
     );
+}
+
+#[tokio::test]
+async fn known_inactive_descendants_allow_cleanup_but_unknown_status_defers() {
+    for (descendant_status, should_delete) in [
+        ("idle", true),
+        ("notLoaded", true),
+        ("systemError", true),
+        ("unknown", false),
+    ] {
+        let harness = Harness::start(1, 30).await;
+        let listener = harness.listener();
+        let child = thread_view(CHILD, SESSION, ROOT_PATH, Some(ROOT), "idle", false);
+        let mut plan = RpcPlan::new(child, turns(vec![completed_turn(TURN)]), TURN);
+        plan.descendants = json!({
+            "data": [thread_view(FORK, SESSION, FORK_PATH, Some(CHILD), descendant_status, true)],
+            "nextCursor": null,
+        });
+        let mut mock = start_rpc_mock(listener, plan).await;
+        harness.hook(subagent_stop(TURN));
+
+        let first_read = next_method(&mut mock, "thread/read").await;
+        assert_eq!(first_read["params"]["threadId"], CHILD);
+        if should_delete {
+            let calls = calls_until_child_delete_after(&mut mock, CHILD, vec![first_read]).await;
+            assert_eq!(calls.last().unwrap()["method"], "thread/delete");
+        } else {
+            let mut calls = vec![first_read];
+            calls.extend(collect_calls(&mut mock, Duration::from_millis(1500)).await);
+            assert!(
+                calls.iter().any(|call| call["method"] == "thread/list"),
+                "unknown descendant status was not checked: {calls:?}"
+            );
+            assert_no_mutation(&calls);
+        }
+    }
 }
 
 #[tokio::test]

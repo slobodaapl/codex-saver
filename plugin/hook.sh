@@ -14,7 +14,7 @@ mkdir -p "$data" || exit 0
 
 update() (
     exec 9>"$data/update.lock" || exit 1
-    flock -x 9 || exit 1
+    flock -x -w 170 9 || exit 1
     now=$(date +%s) || exit 1
     if [ -x "$binary" ] && [ -f "$data/checked" ]; then
         read -r checked < "$data/checked" || checked=0
@@ -40,18 +40,25 @@ update() (
     curl -fsSL --connect-timeout 5 --max-time 20 "$repo/releases/download/$tag/SHA256SUMS" -o "$tmp/SHA256SUMS" || exit 1
     (cd "$tmp" && awk -v name="$asset" '$2 == name {print}' SHA256SUMS | sha256sum -c --status) || exit 1
     chmod 755 "$tmp/$asset" && mv -f "$tmp/$asset" "$binary" || exit 1
+    printf '%s\n' updated
     printf '%s\n' "$tag" > "$tmp/version" && mv -f "$tmp/version" "$data/version"
 )
 
 if [ -x "$binary" ]; then
     if [ "$event" = UserPromptSubmit ]; then
-        (update) </dev/null >/dev/null 2>&1 &
+        before=$(stat -c '%d:%i' "$binary" 2>/dev/null) || before=
+        updated=$(update </dev/null 2>/dev/null) || :
+        after=$(stat -c '%d:%i' "$binary" 2>/dev/null) || after=
+        if [ "$updated" = updated ] || { [ -n "$before" ] && [ -n "$after" ] && [ "$before" != "$after" ]; }; then
+            printf '%s\n' '{"decision":"block","reason":"codex-saver was updated. Reopen this Codex thread and re-trust the hook before resending your message.","systemMessage":"codex-saver was updated. Reopen this Codex thread and re-trust the hook before resending your message."}'
+            exit 0
+        fi
     fi
     exec "$binary" hook
 fi
 
 case $event in
-    Stop|SubagentStop)
+    Stop|SubagentStop|PostModelRequest)
         payload=$(cat)
         read -r uptime _ < /proc/uptime || uptime=0
         observed=${uptime%%.*}

@@ -39,12 +39,29 @@ fn event(input: &serde_json::Value) -> Option<Event> {
     let kind = input.get("hook_event_name")?.as_str()?;
     if !matches!(
         kind,
-        "Stop" | "SubagentStop" | "UserPromptSubmit" | "SubagentStart" | "PreCompact"
+        "Stop"
+            | "SubagentStop"
+            | "UserPromptSubmit"
+            | "SubagentStart"
+            | "PreCompact"
+            | "PostModelRequest"
     ) {
         return None;
     }
     let session_id = Uuid::parse_str(input.get("session_id")?.as_str()?).ok()?;
     let agent_id = input.get("agent_id").and_then(|id| id.as_str());
+    let kind = if kind == "PostModelRequest" {
+        if input.get("status").and_then(|status| status.as_str()) != Some("failed") {
+            return None;
+        }
+        if agent_id.is_some() {
+            "SubagentStop"
+        } else {
+            "Stop"
+        }
+    } else {
+        kind
+    };
     let transcript_path = input.get("transcript_path").and_then(|path| path.as_str());
     let thread_id = match agent_id {
         Some(id) => Uuid::parse_str(id).ok()?,
